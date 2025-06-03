@@ -39,6 +39,14 @@ public class server {
 
     private int currentTurn = 1; // １＝黒（先手）、 ２＝白（後手）
 
+    volatile boolean nicknameThreadFailed = false;
+
+    private Thread nickAThread;
+    private Thread nickBThread;
+
+    private boolean exitRequestedA = false;
+    private boolean exitRequestedB = false;
+
     // コンストラクタ
     public server(int port) { // 待ち受けポート番号を引数に受け取る
         this.port = port;
@@ -84,12 +92,14 @@ public class server {
             objOutB.flush();
 
             // 3. クライアントからニックネームを受信
-            Thread nickA = new Thread(() -> handleNicknameInput(true));
-            Thread nickB = new Thread(() -> handleNicknameInput(false));
-            nickA.start();
-            nickB.start();
-            nickA.join();
-            nickB.join();
+            nickAThread = new Thread(() -> handleNicknameInput(true));
+            nickBThread = new Thread(() -> handleNicknameInput(false));
+            nickAThread.start();
+            nickBThread.start();
+            nickAThread.join();
+            nickBThread.join();
+            if (nicknameThreadFailed)
+                return;
 
             objOutB.writeObject("WAIT_FOR_HANDICAP");
             objOutB.flush();
@@ -134,7 +144,7 @@ public class server {
             out.flush(); // フラッシュしてバッファをクリア
             ObjectInputStream in = isPlayerA ? objInA : objInB;
 
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 String nickname = (String) in.readObject();
                 synchronized (this) {
                     // ニックネームの重複チェック
@@ -169,7 +179,11 @@ public class server {
                         if (isPlayerA) {
                             out.writeObject("WAITING_FOR_OTHER");
                         } else {
-                            out.writeObject("WAIT_FOR_HANDICAP");
+                            if (handicap == 0) {
+                                // ハンディキャップなしならメッセージ送信しない
+                            } else {
+                                out.writeObject("WAIT_FOR_HANDICAP");
+                            }
                         }
                         out.flush();
 
@@ -178,7 +192,13 @@ public class server {
                 }
             }
         } catch (Exception e) {
+            nicknameThreadFailed = true;
+            synchronized (this) {
+                notifyAll();
+            }
             System.err.println("ニックネーム入力中にエラー: " + e.getMessage());
+            handleDisconnection();
+            return;
         }
     }
 
@@ -248,6 +268,8 @@ public class server {
 
         } catch (IOException | ClassNotFoundException | NumberFormatException e) {
             System.err.println("ハンディキャップ提案中にエラー: " + e.getMessage());
+            handleDisconnection();
+            return;
         }
     }
 
@@ -366,10 +388,10 @@ public class server {
         sendHandicapNotice("ハンディキャップ " + handicap + " が適用されました。");
 
         // ハンディキャップに応じて初期配置を設定
-        boardState[3][3] = 1;
-        boardState[3][4] = 2;
-        boardState[4][4] = 1;
-        boardState[4][3] = 2;
+        boardState[3][3] = 2;
+        boardState[3][4] = 1;
+        boardState[4][4] = 2;
+        boardState[4][3] = 1;
 
         if (handicap >= 2)
             boardState[0][0] = 1; // 左上隅
@@ -401,107 +423,31 @@ public class server {
         }
     }
 
-    // 中継のループメソッド
     public void gameLoop() {
         while (true) {
             List<int[]> emptyList = new ArrayList<>();
-            List<int[]> validPoint = calculationValidPoint(); // validPointリストにおける場所の情報を計算して入れる。
+            List<int[]> validPoint = calculationValidPoint();
 
-            if (validPoint.isEmpty()) { // 計算してリストがゼロであるときに（おける場所がない時））
+            if (validPoint.isEmpty()) {
                 System.out.println("プレイヤー " + currentTurn + " は置ける場所がないため、パスします。");
-                if (currentTurn == 1) { // クライアントAの置く場所がない時
+
+                // プレイヤーが置ける場所がない場合、次のプレイヤーにターンを移す
+                int nextTurn = (currentTurn == 1) ? 2 : 1;
+                currentTurn = nextTurn; // ターンを移す
+                List<int[]> nextValid = calculationValidPoint();
+
+                if (nextValid.isEmpty()) {
+                    // 両プレイヤーが置ける場所がない場合
+                    System.out.println("両プレイヤーが置ける場所がないため、ゲーム終了します。");
                     try {
                         GameUpdate updateA = new GameUpdate(
-                                false, // Turnが変わったことを知らせる。
-                                deepCopyBoard(boardState),
-                                handicap,
-                                "置く場所がないためパスになりました。",
-                                PlayerAName,
-                                PlayerBName,
-                                emptyList, // 置く場所がないため空きのリストを送る。
-                                false,
-                                1);
-                        GameUpdate updateB = new GameUpdate(
-                                true, // クライアントAがパスしたのでクライアントBの順番になるので
-                                deepCopyBoard(boardState),
-                                handicap,
-                                "相手が置く場所がないためパスになりました。",
-                                PlayerBName,
-                                PlayerAName,
-                                emptyList, // クライアントAの置く場所を計算したのでクライアントBは空きのリスト
-                                false,
-                                2);
-                        printBoardState("クライアントAの置く場所がない時");
-                        objOutA.writeObject(updateA);
-                        objOutA.flush();
-                        objOutB.writeObject(updateB);
-                        objOutB.flush();
-                    } catch (IOException e) {
-                        System.err.println("ゲーム更新の送信中にエラー: " + e.getMessage());
-                        handleDisconnection();
-                        break;
-                    }
-
-                } else if (currentTurn == 2) {
-                    try {
-                        GameUpdate updateA = new GameUpdate(
-                                true,
-                                deepCopyBoard(boardState),
-                                handicap,
-                                "相手が置く場所がないためパスになりました。",
-                                PlayerAName,
-                                PlayerBName,
-                                emptyList, // クライアントBの置く場所を計算したので空きのリスト
-                                false,
-                                1);
-                        GameUpdate updateB = new GameUpdate(
-                                false,
-                                deepCopyBoard(boardState),
-                                handicap,
-                                "置く場所がないためパスになりました。",
-                                PlayerBName,
-                                PlayerAName,
-                                emptyList, // 置く場所がないため空きのリストを送る。
-                                false,
-                                2);
-                        printBoardState("クライアントBの置く場所がない時");
-                        objOutA.writeObject(updateA);
-                        objOutA.flush();
-                        objOutB.writeObject(updateB);
-                        objOutB.flush();
-                    } catch (IOException e) {
-                        System.err.println("ゲーム更新の送信中にエラー: " + e.getMessage());
-                        handleDisconnection();
-                        break;
-                    }
-
-                }
-                currentTurn = (currentTurn == 1) ? 2 : 1;
-                validPoint = calculationValidPoint();
-
-                if (validPoint.isEmpty()) {
-                    System.out.println("両プレイヤーが置く場所がないため、ゲーム終了します。");
-                    try {
-                        GameUpdate updateA = new GameUpdate(
-                                false,
-                                deepCopyBoard(boardState),
-                                handicap,
+                                false, deepCopyBoard(boardState), handicap,
                                 "ゲームが終了しました。",
-                                PlayerAName,
-                                PlayerBName,
-                                emptyList,
-                                true,
-                                1);
+                                PlayerAName, PlayerBName, emptyList, true, 1);
                         GameUpdate updateB = new GameUpdate(
-                                false,
-                                deepCopyBoard(boardState),
-                                handicap,
+                                false, deepCopyBoard(boardState), handicap,
                                 "ゲームが終了しました。",
-                                PlayerBName,
-                                PlayerAName,
-                                emptyList,
-                                true,
-                                2);
+                                PlayerBName, PlayerAName, emptyList, true, 2);
                         printBoardState("両プレイヤーが置く場所がない時");
                         objOutA.writeObject(updateA);
                         objOutA.flush();
@@ -512,36 +458,55 @@ public class server {
                         handleDisconnection();
                         break;
                     }
-                    endGame();
+                    waitForClientExit();
                     break;
+                } else {
+                    // 片方だけ置けない場合
+                    try {
+                        GameUpdate updateA, updateB;
+                        if (nextTurn == 2) { // 次のターンがプレイヤーBの場合
+                            updateA = new GameUpdate(false, deepCopyBoard(boardState), handicap,
+                                    "置く場所がないためパスになりました。",
+                                    PlayerAName, PlayerBName, emptyList, false, 1);
+                            updateB = new GameUpdate(true, deepCopyBoard(boardState), handicap,
+                                    "相手が置く場所がないためパスになりました。",
+                                    PlayerBName, PlayerAName, emptyList, false, 2);
+                        } else {
+                            updateA = new GameUpdate(true, deepCopyBoard(boardState), handicap,
+                                    "相手が置く場所がないためパスになりました。",
+                                    PlayerAName, PlayerBName, emptyList, false, 1);
+                            updateB = new GameUpdate(false, deepCopyBoard(boardState), handicap,
+                                    "置く場所がないためパスになりました。",
+                                    PlayerBName, PlayerAName, emptyList, false, 2);
+                        }
+                        printBoardState("片方だけ置けない時");
+                        objOutA.writeObject(updateA);
+                        objOutA.flush();
+                        objOutB.writeObject(updateB);
+                        objOutB.flush();
+                    } catch (IOException e) {
+                        System.err.println("ゲーム更新の送信中にエラー: " + e.getMessage());
+                        handleDisconnection();
+                        break;
+                    }
+                    // プレイヤーのターンを移す
+                    continue;
                 }
             }
 
+            // プレイヤーの手番を更新
             try {
                 GameUpdate updateA = new GameUpdate(
-                        currentTurn == 1,
-                        deepCopyBoard(boardState),
-                        handicap,
+                        currentTurn == 1, deepCopyBoard(boardState), handicap,
                         (currentTurn == 1) ? "あなたの番です。" : "相手の番です。",
-                        PlayerAName,
-                        PlayerBName,
-                        (currentTurn == 1) ? validPoint : new ArrayList<>(), // currentTurn ==
-                                                                             // 1(クライアントAの順番の時)はvalidPoint（計算したリスト）を送信そうではない時に空きのリストを送信。
-                        false,
-                        1);
-
+                        PlayerAName, PlayerBName,
+                        (currentTurn == 1) ? validPoint : new ArrayList<>(), false, 1);
                 GameUpdate updateB = new GameUpdate(
-                        currentTurn == 2,
-                        deepCopyBoard(boardState),
-                        handicap,
+                        currentTurn == 2, deepCopyBoard(boardState), handicap,
                         (currentTurn == 2) ? "あなたの番です。" : "相手の番です。",
-                        PlayerBName,
-                        PlayerAName,
-                        (currentTurn == 2) ? validPoint : new ArrayList<>(), // currentTurn ==
-                                                                             // 2(クライアントBの順番の時)はvalidPoint（計算したリスト）を送信そうではない時に空きのリストを送信。
-                        false,
-                        2);
-                printBoardState("クライアントAとクライアントBの順番の時");
+                        PlayerBName, PlayerAName,
+                        (currentTurn == 2) ? validPoint : new ArrayList<>(), false, 2);
+                printBoardState("通常手番処理");
                 objOutA.writeObject(updateA);
                 objOutA.flush();
                 objOutB.writeObject(updateB);
@@ -563,36 +528,25 @@ public class server {
     // クライアント切断時の処理
     private void handleDisconnection() {
         System.out.println("クライアントとの接続が切断されました。ゲームを強制終了します。");
+
         try {
-            if (objOutA != null) {
-                objOutA.writeObject(new GameUpdate(
-                        false,
-                        deepCopyBoard(boardState),
-                        handicap,
-                        "相手との接続が切断されました。ゲームを強制終了します。",
-                        PlayerAName,
-                        PlayerBName,
-                        new ArrayList<>(),
-                        true,
-                        1));
-                objOutA.flush();
-            }
-            if (objOutB != null) {
-                objOutB.writeObject(new GameUpdate(
-                        false,
-                        deepCopyBoard(boardState),
-                        handicap,
-                        "相手との接続が切断されました。ゲームを強制終了します。",
-                        PlayerBName,
-                        PlayerAName,
-                        new ArrayList<>(),
-                        true,
-                        2));
-                objOutB.flush();
-            }
-        } catch (IOException e) {
-            System.err.println("切断通知の送信中にエラー: " + e.getMessage());
+            if (nickAThread != null)
+                nickAThread.interrupt();
+            if (nickBThread != null)
+                nickBThread.interrupt();
         } finally {
+            try {
+                if (objOutA != null && !socketA.isClosed()) {
+                    objOutA.writeObject("DISCONNECTED");
+                    objOutA.flush();
+                }
+                if (objOutB != null && !socketB.isClosed()) {
+                    objOutB.writeObject("DISCONNECTED");
+                    objOutB.flush();
+                }
+            } catch (IOException e) {
+                System.err.println("DISCONNECTED メッセージ送信失敗: " + e.getMessage());
+            }
             endGame();
         }
     }
@@ -688,14 +642,83 @@ public class server {
     }
 
     // endGameメソッド
-    public void endGame() {
-        System.out.println("ゲームが終了しました。クライアントの接続を切断します。");
+    private void endGame() {
+        System.out.println("ゲームが強制終了されました。ソケットを閉じます。");
+        try {
+            if (objOutA != null)
+                objOutA.writeObject("DISCONNECTED");
+            if (objOutB != null)
+                objOutB.writeObject("DISCONNECTED");
+        } catch (IOException e) {
+            System.err.println("DISCONNECTED 送信失敗: " + e.getMessage());
+        }
 
         try {
-            socketA.close();
-            socketB.close();
+            if (socketA != null)
+                socketA.close();
+            if (socketB != null)
+                socketB.close();
         } catch (IOException e) {
-            System.err.println("クライアント切断時にエラー発生: " + e.getMessage());
+            System.err.println("ソケットのクローズ中にエラー: " + e.getMessage());
+        }
+    }
+
+    public void waitForClientExit() {
+        Thread exitWaiterA = new Thread(() -> {
+            try {
+                while (true) {
+                    Object obj = objInA.readObject();
+                    if (obj instanceof String && obj.equals("EXIT")) {
+                        handleExitMessage(true);
+                        break;
+                    }
+                }
+            } catch (IOException | ClassNotFoundException e) {
+                System.err.println("クライアントAのEXIT待機中にエラー: " + e.getMessage());
+            }
+        });
+
+        Thread exitWaiterB = new Thread(() -> {
+            try {
+                while (true) {
+                    Object obj = objInB.readObject();
+                    if (obj instanceof String && obj.equals("EXIT")) {
+                        handleExitMessage(false);
+                        break;
+                    }
+                }
+            } catch (IOException | ClassNotFoundException e) {
+                System.err.println("クライアントBのEXIT待機中にエラー: " + e.getMessage());
+            }
+        });
+
+        exitWaiterA.start();
+        exitWaiterB.start();
+    }
+
+    private void handleExitMessage(boolean fromPlayerA) {
+        System.out.println((fromPlayerA ? "クライアントA" : "クライアントB") + " から EXIT を受信しました。");
+
+        if (fromPlayerA) {
+            exitRequestedA = true;
+            closeSocketSafely(socketA);
+        } else {
+            exitRequestedB = true;
+            closeSocketSafely(socketB);
+        }
+
+        // 両方のクライアントが終了した場合、正常終了処理を呼び出す
+        if ((socketA == null || socketA.isClosed()) && (socketB == null || socketB.isClosed())) {
+            gracefulShutdown();
+        }
+    }
+
+    private void closeSocketSafely(Socket socket) {
+        try {
+            if (socket != null && !socket.isClosed())
+                socket.close();
+        } catch (IOException e) {
+            System.err.println("ソケット終了時エラー: " + e.getMessage());
         }
     }
 
@@ -710,6 +733,21 @@ public class server {
         handicap = 0; // ハンディキャップのリセット
         for (int i = 0; i < HandicapChoices.length; i++) {
             HandicapChoices[i] = 0; // ハンディキャップの選択肢をリセット
+        }
+        nicknameThreadFailed = false; // ニックネームスレッドの失敗フラグをリセット
+    }
+
+    // 正常終了メソッド
+    public void gracefulShutdown() {
+        System.out.println("ゲームが正常に終了しました。ソケットを閉じます。");
+
+        try {
+            if (socketA != null && !socketA.isClosed())
+                socketA.close();
+            if (socketB != null && !socketB.isClosed())
+                socketB.close();
+        } catch (IOException e) {
+            System.err.println("gracefulShutdown中にエラー: " + e.getMessage());
         }
     }
 
@@ -736,6 +774,10 @@ public class server {
         server server = new server(10000); // ポート10000番でサーバオブジェクトを作成
         while (true) {
             server.acceptClient(); // クライアント接続＋ユーザー名登録
+            if (server.nicknameThreadFailed) {
+                server.resetServerState();
+                continue;
+            }
             server.receiveCandidateAndApproval();
             server.startGame(); // ハンディキャップ適用＋スタート
             server.gameLoop(); // ゲームの中継
